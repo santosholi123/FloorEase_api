@@ -29,3 +29,4 @@ router.patch("/:id/status", verifyToken, adminOnly, updateBookingStatus);
 router.delete("/:id", verifyToken, adminOnly, deleteBooking);
 
 module.exports = router;
+//
