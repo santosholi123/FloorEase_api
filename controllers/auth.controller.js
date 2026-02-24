@@ -3,6 +3,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const fs = require("fs");
 const path = require("path");
+const { sendResetOtpEmail } = require("../utils/mailer");
 
 // Register
 exports.register = async (req, res) => {
@@ -112,13 +113,37 @@ exports.getUserProfile = async (req, res) => {
 
 // Update Profile Image
 exports.updateProfileImage = async (req, res) => {
+  const isDev = process.env.NODE_ENV !== "production";
+
   try {
+    console.log("UPDATE PROFILE IMAGE ROUTE HIT: /profile/image");
+    console.log("UPDATE PROFILE IMAGE CONTENT-TYPE:", req.headers["content-type"]);
+    console.log("UPDATE PROFILE IMAGE REQ.FILE EXISTS:", !!req.file);
+
+    if (req.file) {
+      console.log("UPDATE PROFILE IMAGE FILE originalname:", req.file.originalname);
+      console.log("UPDATE PROFILE IMAGE FILE mimetype:", req.file.mimetype);
+      console.log("UPDATE PROFILE IMAGE FILE size:", req.file.size);
+      console.log("UPDATE PROFILE IMAGE FILE filename:", req.file.filename);
+      console.log("UPDATE PROFILE IMAGE FILE path:", req.file.path);
+    }
+
+    console.log("UPDATE PROFILE IMAGE REQ.BODY KEYS:", Object.keys(req.body || {}));
+
     const userId = req.user.id;
-    const { profileImage } = req.body;
+    const { profileImage: profileImageFromBody } = req.body;
+
+    let profileImage = profileImageFromBody;
+
+    if (req.file) {
+      profileImage = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
+    }
 
     if (!profileImage) {
       return res.status(400).json({ message: "profileImage is required" });
     }
+
+    console.log("SAVED PROFILE IMAGE:", profileImage);
 
     const user = await User.findByIdAndUpdate(
       userId,
@@ -129,6 +154,8 @@ exports.updateProfileImage = async (req, res) => {
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
+
+    console.log("UPDATED PROFILE IMAGE IN DB:", user.profileImage);
 
     return res.status(200).json({
       message: "Profile image updated",
@@ -141,7 +168,12 @@ exports.updateProfileImage = async (req, res) => {
       },
     });
   } catch (error) {
-    return res.status(500).json({ message: "Server error", error: error.message });
+    console.error("UPDATE PROFILE IMAGE ERROR:", error);
+    return res.status(500).json({
+      message: "Server error",
+      error: error.message,
+      stack: isDev ? error.stack : undefined,
+    });
   }
 };
 
@@ -261,6 +293,182 @@ exports.updateProfile = async (req, res) => {
     });
   } catch (error) {
     console.error("UPDATE PROFILE ERROR:", error);
+    return res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+// Forgot Password - Request OTP
+exports.forgotPassword = async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    // Validate email
+    if (!email || email.trim() === "") {
+      return res.status(400).json({ message: "Email is required" });
+    }
+
+    const emailLower = email.toLowerCase().trim();
+
+    // Check if user exists
+    const user = await User.findOne({ email: emailLower });
+    if (!user) {
+      // Don't reveal whether email exists (security best practice)
+      return res.status(200).json({ message: "If email exists, OTP has been sent" });
+    }
+
+    // Check rate limiting (allow resend only after 60 seconds)
+    if (user.resetOtpLastSentAt) {
+      const timeSinceLastSent = Date.now() - new Date(user.resetOtpLastSentAt).getTime();
+      if (timeSinceLastSent < 60000) {
+        // 60 seconds in milliseconds
+        const waitTime = Math.ceil((60000 - timeSinceLastSent) / 1000);
+        return res.status(429).json({
+          message: `Please wait ${waitTime} seconds before requesting a new OTP`,
+        });
+      }
+    }
+
+    // Generate 6-digit OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    console.log("FORGOT PASSWORD OTP GENERATED FOR:", emailLower, "OTP:", otp);
+
+    // Hash OTP and store in DB
+    const hashedOtp = await bcrypt.hash(otp, 10);
+
+    // Update user with OTP details
+    user.resetOtpHash = hashedOtp;
+    user.resetOtpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+    user.resetOtpVerified = false;
+    user.resetOtpAttempts = 0;
+    user.resetOtpLastSentAt = new Date();
+
+    await user.save();
+
+    // Send OTP via email
+    try {
+      await sendResetOtpEmail(emailLower, otp);
+    } catch (emailError) {
+      console.error("FORGOT PASSWORD EMAIL ERROR:", emailError);
+      return res.status(500).json({
+        message: "Failed to send OTP email",
+        error: emailError.message,
+      });
+    }
+
+    return res.status(200).json({ message: "OTP sent to your email" });
+  } catch (error) {
+    console.error("FORGOT PASSWORD ERROR:", error);
+    return res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+// Verify Reset OTP
+exports.verifyResetOtp = async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+
+    // Validate inputs
+    if (!email || !otp) {
+      return res.status(400).json({ message: "Email and OTP are required" });
+    }
+
+    const emailLower = email.toLowerCase().trim();
+
+    // Find user
+    const user = await User.findOne({ email: emailLower });
+    if (!user) {
+      return res.status(400).json({ message: "Invalid email or OTP" });
+    }
+
+    // Check if OTP is expired
+    if (!user.resetOtpExpires || new Date() > new Date(user.resetOtpExpires)) {
+      return res.status(400).json({ message: "OTP has expired. Please request a new one" });
+    }
+
+    // Check attempt limit
+    if (user.resetOtpAttempts >= 5) {
+      return res.status(429).json({
+        message: "Too many attempts. Please request a new OTP",
+      });
+    }
+
+    // Verify OTP
+    const isOtpValid = await bcrypt.compare(otp, user.resetOtpHash);
+    if (!isOtpValid) {
+      // Increment attempts
+      user.resetOtpAttempts += 1;
+      await user.save();
+      return res.status(400).json({
+        message: "Invalid OTP",
+        attemptsRemaining: 5 - user.resetOtpAttempts,
+      });
+    }
+
+    // OTP is valid, set resetOtpVerified to true
+    user.resetOtpVerified = true;
+    await user.save();
+
+    return res.status(200).json({ message: "OTP verified successfully" });
+  } catch (error) {
+    console.error("VERIFY RESET OTP ERROR:", error);
+    return res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+// Reset Password
+exports.resetPassword = async (req, res) => {
+  try {
+    const { email, newPassword, confirmPassword } = req.body;
+
+    // Validate inputs
+    if (!email || !newPassword || !confirmPassword) {
+      return res.status(400).json({ message: "Email, password, and confirm password are required" });
+    }
+
+    // Check passwords match
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ message: "Passwords do not match" });
+    }
+
+    // Check password strength (minimum 6 characters)
+    if (newPassword.trim().length < 6) {
+      return res.status(400).json({ message: "Password must be at least 6 characters long" });
+    }
+
+    const emailLower = email.toLowerCase().trim();
+
+    // Find user
+    const user = await User.findOne({ email: emailLower });
+    if (!user) {
+      return res.status(400).json({ message: "Invalid email" });
+    }
+
+    // Check if OTP is verified
+    if (!user.resetOtpVerified) {
+      return res.status(400).json({ message: "Please verify OTP first" });
+    }
+
+    // Check if OTP is still within expiry time
+    if (!user.resetOtpExpires || new Date() > new Date(user.resetOtpExpires)) {
+      return res.status(400).json({ message: "OTP has expired. Please request a new one" });
+    }
+
+    // Hash new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update user password and clear reset fields
+    user.password = hashedPassword;
+    user.resetOtpHash = null;
+    user.resetOtpExpires = null;
+    user.resetOtpVerified = false;
+    user.resetOtpAttempts = 0;
+    user.resetOtpLastSentAt = null;
+
+    await user.save();
+
+    return res.status(200).json({ message: "Password reset successfully. Please login with your new password" });
+  } catch (error) {
+    console.error("RESET PASSWORD ERROR:", error);
     return res.status(500).json({ message: "Server error", error: error.message });
   }
 };

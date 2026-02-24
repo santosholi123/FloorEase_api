@@ -33,6 +33,12 @@ const printRoutes = () => {
   console.log("POST   /api/auth/register");
   console.log("POST   /api/auth/login");
   console.log("GET    /api/auth/profile (🔒 Protected)");
+  console.log("PUT    /api/auth/profile (🔒 Protected)");
+  console.log("PUT    /api/auth/profile/image (🔒 Protected)");
+  console.log("DELETE /api/auth/profile/image (🔒 Protected)");
+  console.log("POST   /api/auth/forgot-password");
+  console.log("POST   /api/auth/verify-reset-otp");
+  console.log("POST   /api/auth/reset-password");
   console.log("POST   /api/upload");
   console.log("POST   /api/bookings (🔒 Protected)");
   console.log("GET    /api/bookings/my (🔒 Protected)");
